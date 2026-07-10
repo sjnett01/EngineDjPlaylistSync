@@ -14,7 +14,10 @@ public sealed class EngineDjPlaylistSync : IDisposable
     public EngineDjPlaylistSync(string dbPath)
     {
         _dbPath = Path.GetFullPath(dbPath);
-        _connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath }.ToString());
+        // Disable SQLite connection pooling so temporary databases can be moved/deleted immediately after disposal.
+        // This is especially important when creating a fresh removable-drive database via VACUUM INTO,
+        // because pooled idle connections can keep the .tmp file locked on Windows.
+        _connection = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = _dbPath, Pooling = false }.ToString());
         _connection.Open();
         _databaseUuid = ScalarString("SELECT uuid FROM Information LIMIT 1")
             ?? throw new InvalidOperationException("Information.uuid not found in database.");
@@ -39,6 +42,217 @@ public sealed class EngineDjPlaylistSync : IDisposable
             .Select(r => new PlaylistInfo(r.Id, BuildPath(r, byId)))
             .ToList();
     }
+
+    public IReadOnlyList<PlaylistInfo> ListAllPlaylists()
+    {
+        var rows = LoadPlaylistRows();
+        var byId = rows.ToDictionary(r => r.Id);
+        return rows
+            .OrderBy(r => BuildPath(r, byId), StringComparer.OrdinalIgnoreCase)
+            .Select(r => new PlaylistInfo(r.Id, BuildPath(r, byId)))
+            .Where(p => !string.IsNullOrWhiteSpace(p.Path))
+            .ToList();
+    }
+
+    public PlaylistSyncPreview PreviewPlaylistDriveSync(IReadOnlyCollection<long> selectedPlaylistIds, string sourceMusicFolder, string destinationFolder)
+    {
+        var selected = selectedPlaylistIds
+            .Where(id => id > 0)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList();
+
+        var destinationEngineLibrary = ResolveDestinationEngineLibraryFolder(destinationFolder);
+        var destinationDatabasePath = GetDestinationDatabasePath(destinationFolder);
+        var rows = LoadPlaylistRows();
+        var byId = rows.ToDictionary(r => r.Id);
+        var preview = new PlaylistSyncPreview
+        {
+            DestinationEngineLibraryPath = destinationEngineLibrary,
+            DestinationDatabasePath = destinationDatabasePath,
+            DestinationDatabaseExists = File.Exists(destinationDatabasePath),
+            SelectedPlaylistCount = selected.Count
+        };
+
+        var uniqueTrackIds = new HashSet<long>();
+
+        foreach (var playlistId in selected)
+        {
+            var playlistRow = byId.TryGetValue(playlistId, out var row) ? row : null;
+            var playlistPath = playlistRow is null ? playlistId.ToString(CultureInfo.InvariantCulture) : BuildPath(playlistRow, byId);
+            var tracks = LoadPlaylistTrackRows(playlistId);
+            preview.Playlists.Add(new PlaylistSyncPlaylistPreview(playlistId, playlistPath, tracks.Count));
+            preview.PlaylistRows += tracks.Count;
+
+            foreach (var track in tracks)
+            {
+                uniqueTrackIds.Add(track.TrackId);
+                var sourcePath = ResolveBestExistingTrackPath(track.StoredPath, sourceMusicFolder);
+                var destinationPath = GetDestinationPathForStoredTrack(destinationEngineLibrary, track.StoredPath);
+                preview.Tracks.Add(new PlaylistSyncTrackPreview(
+                    track.TrackId,
+                    playlistId,
+                    playlistPath,
+                    string.IsNullOrWhiteSpace(track.Title) ? GetTrackDisplayName(track.StoredPath, track.Title) : track.Title,
+                    track.Artist,
+                    track.StoredPath,
+                    sourcePath,
+                    destinationPath,
+                    File.Exists(sourcePath),
+                    File.Exists(destinationPath)));
+            }
+        }
+
+        preview.UniqueTracks = uniqueTrackIds.Count;
+        preview.SourceFilesMissing = preview.Tracks
+            .Where(t => uniqueTrackIds.Contains(t.TrackId))
+            .GroupBy(t => t.TrackId)
+            .Select(g => g.First())
+            .Count(t => !t.SourceExists);
+        preview.FilesAlreadyOnDestination = preview.Tracks
+            .Where(t => uniqueTrackIds.Contains(t.TrackId))
+            .GroupBy(t => t.TrackId)
+            .Select(g => g.First())
+            .Count(t => t.SourceExists && t.DestinationExists);
+        preview.FilesToCopy = preview.Tracks
+            .Where(t => uniqueTrackIds.Contains(t.TrackId))
+            .GroupBy(t => t.TrackId)
+            .Select(g => g.First())
+            .Count(t => t.SourceExists && !t.DestinationExists);
+
+        return preview;
+    }
+
+
+    public PlaylistDriveDatabaseSyncResult SyncSelectedPlaylistsToDestination(IReadOnlyCollection<long> selectedPlaylistIds, string sourceMusicFolder, string destinationFolder, Action<string>? log = null, Action<PlaylistDatabaseSyncProgress>? progress = null)
+    {
+        var selected = selectedPlaylistIds
+            .Where(id => id > 0)
+            .Distinct()
+            .OrderBy(id => id)
+            .ToList();
+
+        var result = new PlaylistDriveDatabaseSyncResult
+        {
+            DestinationDatabasePath = GetDestinationDatabasePath(destinationFolder)
+        };
+
+        if (selected.Count == 0)
+            return result;
+
+        if (!File.Exists(result.DestinationDatabasePath))
+        {
+            result.DestinationDatabaseCreated = CreateEmptyDestinationDatabaseFromSource(result.DestinationDatabasePath, log);
+            log?.Invoke("Destination database created: " + result.DestinationDatabasePath);
+        }
+
+        var destinationEngineLibrary = ResolveDestinationEngineLibraryFolder(destinationFolder);
+        var rows = LoadPlaylistRows();
+        var byId = rows.ToDictionary(r => r.Id);
+        var plans = new List<PlaylistDriveDatabasePlaylistPlan>();
+
+        foreach (var playlistId in selected)
+        {
+            if (!byId.TryGetValue(playlistId, out var playlistRow))
+                continue;
+
+            var playlistPath = BuildPath(playlistRow, byId);
+            if (string.IsNullOrWhiteSpace(playlistPath))
+                continue;
+
+            var tracks = LoadPlaylistTrackRows(playlistId);
+            plans.Add(new PlaylistDriveDatabasePlaylistPlan(playlistId, playlistPath, tracks));
+            result.SourcePlaylistRows += tracks.Count;
+        }
+
+        result.SelectedPlaylists = plans.Count;
+        if (plans.Count == 0)
+            return result;
+
+        using var destination = new EngineDjPlaylistSync(result.DestinationDatabasePath);
+        if (!result.DestinationDatabaseCreated)
+        {
+            result.BackupPath = destination.CreatePlaylistSyncBackup(destinationFolder);
+            log?.Invoke("Destination database backup created: " + result.BackupPath);
+        }
+
+        destination.Execute("BEGIN IMMEDIATE");
+        try
+        {
+            var trackMap = destination.LoadTrackMapByStoredPath();
+            var identityIndex = destination.LoadTrackIdentityIndex();
+            var sourceToDestinationTrackIds = new Dictionary<long, long>();
+            var missingDestinationTrackIds = new HashSet<long>();
+            var analysisCopiedSourceTrackIds = new HashSet<long>();
+            var currentPlaylist = 0;
+
+            foreach (var plan in plans)
+            {
+                currentPlaylist++;
+                progress?.Invoke(new PlaylistDatabaseSyncProgress(currentPlaylist, plans.Count, plan.Path));
+
+                var ensure = destination.EnsurePlaylistPathForSync(plan.Path);
+                result.PlaylistsCreated += ensure.CreatedCount;
+
+                var removedRows = destination.ExecuteCount("DELETE FROM PlaylistEntity WHERE listId = $listId", ("$listId", ensure.PlaylistId));
+                result.PlaylistRowsRemoved += removedRows;
+
+                var orderedDestinationTrackIds = new List<long>(plan.Tracks.Count);
+                foreach (var track in plan.Tracks)
+                {
+                    if (!sourceToDestinationTrackIds.TryGetValue(track.TrackId, out var destinationTrackId))
+                    {
+                        var destinationFile = GetDestinationPathForStoredTrack(destinationEngineLibrary, track.StoredPath);
+                        if (!File.Exists(destinationFile))
+                        {
+                            result.PlaylistRowsSkippedMissingFiles++;
+                            if (missingDestinationTrackIds.Add(track.TrackId))
+                            {
+                                result.TracksMissingOnDestination++;
+                                log?.Invoke("Skipping track not found on destination drive: " + destinationFile);
+                            }
+                            continue;
+                        }
+
+                        var insert = destination.InsertTrackIfMissingEngineSyncStyle(destinationFile, trackMap, identityIndex, log);
+                        destinationTrackId = insert.TrackId;
+                        sourceToDestinationTrackIds[track.TrackId] = destinationTrackId;
+                        if (insert.WasInserted)
+                            result.TracksInserted++;
+                        else
+                            result.TracksAlreadyInDatabase++;
+
+                        if (analysisCopiedSourceTrackIds.Add(track.TrackId))
+                        {
+                            var analysisCopy = CopyTrackAnalysisToDestination(track.TrackId, destination, destinationTrackId, log);
+                            result.AnalysisRowsCopied += analysisCopy.PerformanceDataRowsCopied;
+                            result.AnalysisRowsMissing += analysisCopy.PerformanceDataRowsMissing;
+                            result.TrackAnalysisFieldsCopied += analysisCopy.TrackAnalysisFieldsCopied;
+                            result.OverviewDataFilesCopied += analysisCopy.OverviewDataFilesCopied;
+                            result.OverviewDataFilesMissing += analysisCopy.OverviewDataFilesMissing;
+                            result.AnalysisCopyFailures += analysisCopy.Failures;
+                        }
+                    }
+
+                    orderedDestinationTrackIds.Add(destinationTrackId);
+                }
+
+                destination.WritePlaylistEntitiesInOrder(ensure.PlaylistId, orderedDestinationTrackIds);
+                destination.TouchPlaylistCompatibility(ensure.PlaylistId);
+                destination.EnsurePlaylistSiblingChain(destination.GetPlaylistParentId(ensure.PlaylistId));
+                result.PlaylistRowsWritten += orderedDestinationTrackIds.Count;
+            }
+
+            destination.Execute("COMMIT");
+            return result;
+        }
+        catch
+        {
+            destination.Execute("ROLLBACK");
+            throw;
+        }
+    }
+
 
     public MissingTrackFilesResult FindMissingTrackFilesForImportedCollectionScope(string musicFolder, long? selectedPlaylistId, bool entireRootCollection, Action<string>? log = null, Action<TrackScanProgress>? progress = null)
     {
@@ -373,6 +587,391 @@ WHERE id = $trackId",
         File.WriteAllBytes(Path.Combine(folder, trackId.ToString(CultureInfo.InvariantCulture) + ".rgb"), rgbCacheBlob);
     }
 
+    private bool CreateEmptyDestinationDatabaseFromSource(string destinationDatabasePath, Action<string>? log)
+    {
+        if (File.Exists(destinationDatabasePath))
+            return false;
+
+        var databaseFolder = Path.GetDirectoryName(destinationDatabasePath)
+            ?? throw new InvalidOperationException("Cannot determine destination Database2 folder.");
+        Directory.CreateDirectory(databaseFolder);
+        Directory.CreateDirectory(Path.Combine(databaseFolder, "OverviewData"));
+        DeleteStaleCreatingTempFiles(destinationDatabasePath);
+
+        var temporaryPath = destinationDatabasePath + ".creating-" + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            if (File.Exists(temporaryPath))
+                File.Delete(temporaryPath);
+
+            using (var cmd = _connection.CreateCommand())
+            {
+                cmd.CommandText = "VACUUM INTO $destinationDatabasePath";
+                cmd.Parameters.AddWithValue("$destinationDatabasePath", temporaryPath);
+                cmd.ExecuteNonQuery();
+            }
+
+            using (var template = new EngineDjPlaylistSync(temporaryPath))
+            {
+                template.PrepareCopiedDatabaseAsEmptyDestination(log);
+            }
+
+            // Give Windows/SQLite a short chance to release the just-created template file before
+            // renaming it into place. Without this, some systems leave m.db.creating-*.tmp behind
+            // with "The process cannot access the file because it is being used by another process."
+            MoveFileWithRetry(temporaryPath, destinationDatabasePath);
+            return true;
+        }
+        catch
+        {
+            TryDeleteFile(temporaryPath);
+            throw;
+        }
+    }
+
+    private void PrepareCopiedDatabaseAsEmptyDestination(Action<string>? log)
+    {
+        Execute("BEGIN IMMEDIATE");
+        try
+        {
+            foreach (var tableName in GetPlaylistSyncTemplateTablesToClear())
+            {
+                if (!TableExists(tableName))
+                    continue;
+
+                Execute("DELETE FROM " + QuoteSqlIdentifier(tableName));
+            }
+
+            ResetSqliteSequenceForPlaylistSyncTemplate();
+            RegenerateInformationUuidForPlaylistSyncTemplate();
+            Execute("COMMIT");
+        }
+        catch
+        {
+            Execute("ROLLBACK");
+            throw;
+        }
+
+        try
+        {
+            Execute("VACUUM");
+        }
+        catch (Exception ex)
+        {
+            log?.Invoke("Created destination database, but compacting the new database failed: " + ex.Message);
+        }
+    }
+
+    private static IReadOnlyList<string> GetPlaylistSyncTemplateTablesToClear() =>
+    [
+        "PlaylistEntity",
+        "PreparelistEntity",
+        "HistoryPlaylistEntity",
+        "CrateEntity",
+        "PerformanceData",
+        "Track",
+        "Playlist",
+        "Preparelist",
+        "HistoryPlaylist",
+        "Crate",
+        "SmartlistEntity",
+        "Smartlist",
+        "AlbumArt"
+    ];
+
+    private void ResetSqliteSequenceForPlaylistSyncTemplate()
+    {
+        if (!TableExists("sqlite_sequence"))
+            return;
+
+        foreach (var tableName in GetPlaylistSyncTemplateTablesToClear())
+            Execute("DELETE FROM sqlite_sequence WHERE name = $name", ("$name", tableName));
+    }
+
+    private void RegenerateInformationUuidForPlaylistSyncTemplate()
+    {
+        if (!TableExists("Information"))
+            return;
+
+        var columns = GetTableColumnNames("Information");
+        if (!columns.Any(column => string.Equals(column, "uuid", StringComparison.OrdinalIgnoreCase)))
+            return;
+
+        Execute("UPDATE Information SET uuid = $uuid", ("$uuid", Guid.NewGuid().ToString("D")));
+    }
+
+    private static void DeleteStaleCreatingTempFiles(string destinationDatabasePath)
+    {
+        var folder = Path.GetDirectoryName(destinationDatabasePath);
+        var fileName = Path.GetFileName(destinationDatabasePath);
+
+        if (string.IsNullOrWhiteSpace(folder) || string.IsNullOrWhiteSpace(fileName) || !Directory.Exists(folder))
+            return;
+
+        foreach (var path in Directory.EnumerateFiles(folder, fileName + ".creating-*.tmp"))
+            TryDeleteFile(path);
+    }
+
+    private static void MoveFileWithRetry(string sourcePath, string destinationPath)
+    {
+        const int maxAttempts = 20;
+        IOException? lastIOException = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            try
+            {
+                File.Move(sourcePath, destinationPath);
+                return;
+            }
+            catch (IOException ex) when (attempt < maxAttempts)
+            {
+                lastIOException = ex;
+                Thread.Sleep(150);
+            }
+            catch (UnauthorizedAccessException ex) when (attempt < maxAttempts)
+            {
+                lastIOException = new IOException(ex.Message, ex);
+                Thread.Sleep(150);
+            }
+        }
+
+        if (lastIOException is not null)
+            throw lastIOException;
+
+        File.Move(sourcePath, destinationPath);
+    }
+
+    private static void TryDeleteFile(string path)
+    {
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                File.Delete(path);
+        }
+        catch
+        {
+            // Best-effort cleanup only.
+        }
+    }
+
+    private TrackAnalysisCopyResult CopyTrackAnalysisToDestination(long sourceTrackId, EngineDjPlaylistSync destination, long destinationTrackId, Action<string>? log)
+    {
+        var result = new TrackAnalysisCopyResult();
+
+        try
+        {
+            if (CopyPerformanceDataRowToDestination(sourceTrackId, destination, destinationTrackId))
+                result.PerformanceDataRowsCopied++;
+            else
+                result.PerformanceDataRowsMissing++;
+        }
+        catch (Exception ex)
+        {
+            result.Failures++;
+            log?.Invoke($"Could not copy Engine DJ PerformanceData for source track {sourceTrackId}: {ex.Message}");
+        }
+
+        try
+        {
+            if (CopyTrackAnalysisColumnsToDestination(sourceTrackId, destination, destinationTrackId))
+                result.TrackAnalysisFieldsCopied++;
+        }
+        catch (Exception ex)
+        {
+            result.Failures++;
+            log?.Invoke($"Could not copy Engine DJ Track analysis fields for source track {sourceTrackId}: {ex.Message}");
+        }
+
+        try
+        {
+            if (CopyOverviewRgbCacheToDestination(sourceTrackId, destination, destinationTrackId))
+                result.OverviewDataFilesCopied++;
+            else
+                result.OverviewDataFilesMissing++;
+        }
+        catch (Exception ex)
+        {
+            result.Failures++;
+            log?.Invoke($"Could not copy Engine DJ overview waveform cache for source track {sourceTrackId}: {ex.Message}");
+        }
+
+        return result;
+    }
+
+    private bool CopyPerformanceDataRowToDestination(long sourceTrackId, EngineDjPlaylistSync destination, long destinationTrackId)
+    {
+        const string tableName = "PerformanceData";
+        const string trackIdColumn = "trackId";
+
+        if (!TableExists(tableName) || !destination.TableExists(tableName))
+            return false;
+
+        var sourceColumns = GetTableColumnNames(tableName);
+        var destinationColumns = destination.GetTableColumnNames(tableName);
+        var sourceColumnSet = new HashSet<string>(sourceColumns, StringComparer.OrdinalIgnoreCase);
+        var columnsToCopy = destinationColumns
+            .Where(column => !string.Equals(column, trackIdColumn, StringComparison.OrdinalIgnoreCase) && sourceColumnSet.Contains(column))
+            .ToList();
+
+        if (!sourceColumnSet.Contains(trackIdColumn) || !destinationColumns.Any(column => string.Equals(column, trackIdColumn, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        var row = ReadRowByLongColumn(tableName, trackIdColumn, sourceTrackId, columnsToCopy);
+        if (row is null)
+            return false;
+
+        destination.ExecuteCount($"DELETE FROM {QuoteSqlIdentifier(tableName)} WHERE {QuoteSqlIdentifier(trackIdColumn)} = $trackId", ("$trackId", destinationTrackId));
+        destination.InsertRowWithTrackId(tableName, trackIdColumn, destinationTrackId, columnsToCopy, row);
+        return true;
+    }
+
+    private bool CopyTrackAnalysisColumnsToDestination(long sourceTrackId, EngineDjPlaylistSync destination, long destinationTrackId)
+    {
+        const string tableName = "Track";
+        const string idColumn = "id";
+        string[] desiredColumns = ["bpm", "bpmAnalyzed", "key", "isAnalyzed"];
+
+        var sourceColumns = GetTableColumnNames(tableName);
+        var destinationColumns = destination.GetTableColumnNames(tableName);
+        var sourceColumnSet = new HashSet<string>(sourceColumns, StringComparer.OrdinalIgnoreCase);
+        var destinationColumnSet = new HashSet<string>(destinationColumns, StringComparer.OrdinalIgnoreCase);
+        var columnsToCopy = desiredColumns
+            .Where(column => sourceColumnSet.Contains(column) && destinationColumnSet.Contains(column))
+            .ToList();
+
+        if (columnsToCopy.Count == 0)
+            return false;
+
+        var row = ReadRowByLongColumn(tableName, idColumn, sourceTrackId, columnsToCopy);
+        if (row is null)
+            return false;
+
+        destination.UpdateRowByLongColumn(tableName, idColumn, destinationTrackId, row);
+
+        if (destinationColumnSet.Contains("isAvailable"))
+        {
+            destination.Execute("UPDATE Track SET isAvailable = 1 WHERE id = $trackId", ("$trackId", destinationTrackId));
+        }
+
+        if (destinationColumnSet.Contains("lastEditTime"))
+        {
+            destination.Execute("UPDATE Track SET lastEditTime = $editTime WHERE id = $trackId",
+                ("$editTime", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)),
+                ("$trackId", destinationTrackId));
+        }
+
+        return true;
+    }
+
+    private bool CopyOverviewRgbCacheToDestination(long sourceTrackId, EngineDjPlaylistSync destination, long destinationTrackId)
+    {
+        var sourcePath = GetOverviewRgbCachePath(sourceTrackId);
+        if (!File.Exists(sourcePath))
+            return false;
+
+        var destinationPath = destination.GetOverviewRgbCachePath(destinationTrackId);
+        var destinationFolder = Path.GetDirectoryName(destinationPath);
+        if (!string.IsNullOrWhiteSpace(destinationFolder))
+            Directory.CreateDirectory(destinationFolder);
+
+        File.Copy(sourcePath, destinationPath, overwrite: true);
+        return true;
+    }
+
+    private string GetOverviewRgbCachePath(long trackId)
+    {
+        var database2Folder = Path.GetDirectoryName(_dbPath)
+            ?? throw new InvalidOperationException("Cannot determine Database2 folder from db path.");
+        return Path.Combine(database2Folder, "OverviewData", _databaseUuid, trackId.ToString(CultureInfo.InvariantCulture) + ".rgb");
+    }
+
+    private bool TableExists(string tableName)
+    {
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = $tableName LIMIT 1";
+        cmd.Parameters.AddWithValue("$tableName", tableName);
+        return cmd.ExecuteScalar() is not null;
+    }
+
+    private List<string> GetTableColumnNames(string tableName)
+    {
+        var columns = new List<string>();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "PRAGMA table_info(" + QuoteSqlIdentifier(tableName) + ")";
+        using var reader = cmd.ExecuteReader();
+        while (reader.Read())
+        {
+            if (!reader.IsDBNull(1))
+                columns.Add(reader.GetString(1));
+        }
+        return columns;
+    }
+
+    private Dictionary<string, object?>? ReadRowByLongColumn(string tableName, string keyColumn, long keyValue, IReadOnlyList<string> columns)
+    {
+        if (columns.Count == 0)
+            return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "SELECT " + string.Join(", ", columns.Select(QuoteSqlIdentifier)) +
+                          " FROM " + QuoteSqlIdentifier(tableName) +
+                          " WHERE " + QuoteSqlIdentifier(keyColumn) + " = $keyValue LIMIT 1";
+        cmd.Parameters.AddWithValue("$keyValue", keyValue);
+
+        using var reader = cmd.ExecuteReader();
+        if (!reader.Read())
+            return null;
+
+        var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < columns.Count; i++)
+        {
+            row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+        }
+
+        return row;
+    }
+
+    private void InsertRowWithTrackId(string tableName, string trackIdColumn, long trackId, IReadOnlyList<string> columns, IReadOnlyDictionary<string, object?> row)
+    {
+        var insertColumns = new List<string> { trackIdColumn };
+        insertColumns.AddRange(columns);
+
+        var valueNames = new List<string> { "$trackId" };
+        for (var i = 0; i < columns.Count; i++)
+            valueNames.Add("$value" + i.ToString(CultureInfo.InvariantCulture));
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "INSERT INTO " + QuoteSqlIdentifier(tableName) +
+                          " (" + string.Join(", ", insertColumns.Select(QuoteSqlIdentifier)) + ") VALUES (" +
+                          string.Join(", ", valueNames) + ")";
+        cmd.Parameters.AddWithValue("$trackId", trackId);
+        for (var i = 0; i < columns.Count; i++)
+        {
+            var value = row.TryGetValue(columns[i], out var current) ? current : null;
+            cmd.Parameters.AddWithValue("$value" + i.ToString(CultureInfo.InvariantCulture), value ?? DBNull.Value);
+        }
+        cmd.ExecuteNonQuery();
+    }
+
+    private void UpdateRowByLongColumn(string tableName, string keyColumn, long keyValue, IReadOnlyDictionary<string, object?> row)
+    {
+        if (row.Count == 0)
+            return;
+
+        var columns = row.Keys.ToList();
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "UPDATE " + QuoteSqlIdentifier(tableName) + " SET " +
+                          string.Join(", ", columns.Select((column, index) => QuoteSqlIdentifier(column) + " = $value" + index.ToString(CultureInfo.InvariantCulture))) +
+                          " WHERE " + QuoteSqlIdentifier(keyColumn) + " = $keyValue";
+        cmd.Parameters.AddWithValue("$keyValue", keyValue);
+        for (var i = 0; i < columns.Count; i++)
+            cmd.Parameters.AddWithValue("$value" + i.ToString(CultureInfo.InvariantCulture), row[columns[i]] ?? DBNull.Value);
+        cmd.ExecuteNonQuery();
+    }
+
+    private static string QuoteSqlIdentifier(string identifier) => "\"" + identifier.Replace("\"", "\"\"") + "\"";
+
     private Dictionary<string, long> LoadTrackMapByStoredPath()
     {
         var map = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
@@ -657,6 +1256,99 @@ SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$nextEntityId", nextEntityId);
             nextEntityId = Convert.ToInt64(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
         }
+    }
+
+    private void WritePlaylistEntitiesInOrder(long playlistId, IReadOnlyList<long> orderedTrackIds)
+    {
+        var nextEntityId = 0L;
+        for (var i = orderedTrackIds.Count - 1; i >= 0; i--)
+        {
+            using var cmd = _connection.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO PlaylistEntity (listId, trackId, databaseUuid, nextEntityId, membershipReference)
+VALUES ($listId, $trackId, $databaseUuid, $nextEntityId, 0);
+SELECT last_insert_rowid();";
+            cmd.Parameters.AddWithValue("$listId", playlistId);
+            cmd.Parameters.AddWithValue("$trackId", orderedTrackIds[i]);
+            cmd.Parameters.AddWithValue("$databaseUuid", _databaseUuid);
+            cmd.Parameters.AddWithValue("$nextEntityId", nextEntityId);
+            nextEntityId = Convert.ToInt64(cmd.ExecuteScalar(), CultureInfo.InvariantCulture);
+        }
+    }
+
+    private PlaylistEnsureResult EnsurePlaylistPathForSync(string playlistPath)
+    {
+        var parts = SplitPlaylistPath(playlistPath);
+        if (parts.Length == 0)
+            throw new InvalidOperationException("Playlist path is empty.");
+
+        long parent = 0;
+        long current = 0;
+        var created = 0;
+
+        foreach (var part in parts)
+        {
+            var existing = ScalarLong("SELECT id FROM Playlist WHERE title = $title AND parentListId = $parent LIMIT 1",
+                ("$title", part), ("$parent", parent));
+
+            if (existing is not null)
+            {
+                current = existing.Value;
+                ForcePlaylistCompatibilityFlags(current);
+                parent = current;
+                continue;
+            }
+
+            current = InsertPlaylistCompatibility(part, parent, GetUnusedTemporaryNextListId(parent));
+            created++;
+            EnsurePlaylistSiblingChain(parent);
+            parent = current;
+        }
+
+        return new PlaylistEnsureResult(current, created);
+    }
+
+    private string CreatePlaylistSyncBackup(string? destinationFolder = null)
+    {
+        var backupFolder = ResolvePlaylistSyncBackupFolder(destinationFolder);
+        Directory.CreateDirectory(backupFolder);
+
+        var timestamp = DateTime.Now.ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture);
+        var backupPath = Path.Combine(backupFolder, "m.db.playlistsync-backup-" + timestamp);
+        var suffix = 1;
+        while (File.Exists(backupPath))
+        {
+            backupPath = Path.Combine(backupFolder, "m.db.playlistsync-backup-" + timestamp + "-" + suffix.ToString(CultureInfo.InvariantCulture));
+            suffix++;
+        }
+
+        using var cmd = _connection.CreateCommand();
+        cmd.CommandText = "VACUUM INTO $backupPath";
+        cmd.Parameters.AddWithValue("$backupPath", backupPath);
+        cmd.ExecuteNonQuery();
+        return backupPath;
+    }
+
+    private string ResolvePlaylistSyncBackupFolder(string? destinationFolder)
+    {
+        string? driveRoot = null;
+
+        if (!string.IsNullOrWhiteSpace(destinationFolder))
+        {
+            var fullDestination = Path.GetFullPath(destinationFolder);
+            driveRoot = Path.GetPathRoot(fullDestination);
+        }
+
+        if (string.IsNullOrWhiteSpace(driveRoot))
+        {
+            var databaseFolder = Path.GetDirectoryName(_dbPath) ?? Environment.CurrentDirectory;
+            driveRoot = Path.GetPathRoot(Path.GetFullPath(databaseFolder));
+        }
+
+        if (string.IsNullOrWhiteSpace(driveRoot))
+            driveRoot = Path.GetDirectoryName(_dbPath) ?? Environment.CurrentDirectory;
+
+        return Path.Combine(driveRoot, "backups");
     }
 
     private void TouchPlaylistCompatibility(long playlistId)
@@ -1250,6 +1942,129 @@ LIMIT 1";
 
 
 
+    public static string ResolveDestinationEngineLibraryFolder(string destinationFolder)
+    {
+        var selectedFullPath = Path.GetFullPath(destinationFolder);
+        var root = Path.GetPathRoot(selectedFullPath) ?? string.Empty;
+        var selected = selectedFullPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (selected.Length < root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Length)
+            selected = selectedFullPath;
+        if (selected.Length == 2 && selected[1] == ':')
+            selected += Path.DirectorySeparatorChar;
+        var selectedName = Path.GetFileName(selected.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+        if (string.Equals(Path.GetFileName(selected), "m.db", StringComparison.OrdinalIgnoreCase))
+        {
+            var database2Folder = Path.GetDirectoryName(selected) ?? selected;
+            return Path.GetDirectoryName(database2Folder) ?? database2Folder;
+        }
+
+        if (string.Equals(selectedName, "Database2", StringComparison.OrdinalIgnoreCase))
+            return Path.GetDirectoryName(selected) ?? selected;
+
+        if (string.Equals(selectedName, "Engine Library", StringComparison.OrdinalIgnoreCase))
+            return selected;
+
+        if (File.Exists(Path.Combine(selected, "Database2", "m.db")))
+            return selected;
+
+        return Path.Combine(selected, "Engine Library");
+    }
+
+    public static string GetDestinationDatabasePath(string destinationFolder)
+    {
+        return Path.Combine(ResolveDestinationEngineLibraryFolder(destinationFolder), "Database2", "m.db");
+    }
+
+    private string ResolveBestExistingTrackPath(string storedPath, string sourceMusicFolder)
+    {
+        var candidates = GetCandidateAbsolutePaths(storedPath, sourceMusicFolder).ToList();
+        return candidates.FirstOrDefault(File.Exists) ?? candidates.FirstOrDefault() ?? StripEngineHistorySuffix(storedPath);
+    }
+
+    private static string GetDestinationPathForStoredTrack(string destinationEngineLibrary, string storedPath)
+    {
+        var clean = StripEngineHistorySuffix(storedPath).Trim();
+        if (string.IsNullOrWhiteSpace(clean))
+            return destinationEngineLibrary;
+
+        var normalized = clean.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        if (Path.IsPathRooted(normalized))
+            normalized = Path.GetPathRoot(normalized) is { } root ? Path.GetRelativePath(root, normalized) : Path.GetFileName(normalized);
+
+        return Path.GetFullPath(Path.Combine(destinationEngineLibrary, normalized));
+    }
+
+    private List<PlaylistTrackRow> LoadPlaylistTrackRows(long playlistId)
+    {
+        var rows = new List<PlaylistEntityTrackRow>();
+        using (var cmd = _connection.CreateCommand())
+        {
+            cmd.CommandText = @"
+SELECT pe.id, pe.trackId, pe.nextEntityId, COALESCE(t.path, ''), COALESCE(t.title, ''), COALESCE(t.artist, '')
+FROM PlaylistEntity pe
+LEFT JOIN Track t ON t.id = pe.trackId
+WHERE pe.listId = $listId
+ORDER BY pe.id";
+            cmd.Parameters.AddWithValue("$listId", playlistId);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                rows.Add(new PlaylistEntityTrackRow(
+                    reader.GetInt64(0),
+                    reader.IsDBNull(1) ? 0 : reader.GetInt64(1),
+                    reader.IsDBNull(2) ? 0 : reader.GetInt64(2),
+                    reader.IsDBNull(3) ? string.Empty : reader.GetString(3),
+                    reader.IsDBNull(4) ? string.Empty : reader.GetString(4),
+                    reader.IsDBNull(5) ? string.Empty : reader.GetString(5)));
+            }
+        }
+
+        return OrderPlaylistEntityRows(rows)
+            .Where(r => r.TrackId > 0 && !string.IsNullOrWhiteSpace(r.StoredPath))
+            .Select(r => new PlaylistTrackRow(r.TrackId, r.StoredPath, r.Title, r.Artist))
+            .ToList();
+    }
+
+    private static IReadOnlyList<PlaylistEntityTrackRow> OrderPlaylistEntityRows(IReadOnlyList<PlaylistEntityTrackRow> rows)
+    {
+        if (rows.Count <= 1)
+            return rows.ToList();
+
+        var byEntityId = rows.ToDictionary(r => r.EntityId);
+        var referenced = rows
+            .Where(r => r.NextEntityId != 0 && byEntityId.ContainsKey(r.NextEntityId))
+            .Select(r => r.NextEntityId)
+            .ToHashSet();
+
+        var heads = rows
+            .Where(r => !referenced.Contains(r.EntityId))
+            .OrderBy(r => r.EntityId)
+            .ToList();
+
+        if (heads.Count == 0)
+            heads.Add(rows.OrderBy(r => r.EntityId).First());
+
+        var ordered = new List<PlaylistEntityTrackRow>();
+        var visited = new HashSet<long>();
+        foreach (var head in heads)
+        {
+            var current = head;
+            while (visited.Add(current.EntityId))
+            {
+                ordered.Add(current);
+                if (current.NextEntityId == 0 || !byEntityId.TryGetValue(current.NextEntityId, out var next))
+                    break;
+                current = next;
+            }
+        }
+
+        foreach (var orphan in rows.Where(r => !visited.Contains(r.EntityId)).OrderBy(r => r.EntityId))
+            ordered.Add(orphan);
+
+        return ordered;
+    }
+
     private string GetEngineLibraryFolder()
     {
         var database2Folder = Path.GetDirectoryName(_dbPath)
@@ -1463,7 +2278,63 @@ public sealed record PlaylistInfo(long Id, string Path)
     public override string ToString() => Path;
 }
 
+public sealed record PlaylistSyncPlaylistPreview(long PlaylistId, string Path, int TrackCount);
+
+public sealed record PlaylistSyncTrackPreview(long TrackId, long PlaylistId, string PlaylistPath, string Title, string Artist, string StoredPath, string SourcePath, string DestinationPath, bool SourceExists, bool DestinationExists);
+
+public sealed record PlaylistDatabaseSyncProgress(int Current, int Total, string PlaylistPath);
+
+public sealed class PlaylistDriveDatabaseSyncResult
+{
+    public string DestinationDatabasePath { get; set; } = string.Empty;
+    public string BackupPath { get; set; } = string.Empty;
+    public int SelectedPlaylists { get; set; }
+    public int SourcePlaylistRows { get; set; }
+    public int PlaylistRowsRemoved { get; set; }
+    public int PlaylistRowsWritten { get; set; }
+    public int PlaylistRowsSkippedMissingFiles { get; set; }
+    public int PlaylistsCreated { get; set; }
+    public int TracksInserted { get; set; }
+    public int TracksAlreadyInDatabase { get; set; }
+    public int TracksMissingOnDestination { get; set; }
+    public bool DestinationDatabaseCreated { get; set; }
+    public int AnalysisRowsCopied { get; set; }
+    public int AnalysisRowsMissing { get; set; }
+    public int TrackAnalysisFieldsCopied { get; set; }
+    public int OverviewDataFilesCopied { get; set; }
+    public int OverviewDataFilesMissing { get; set; }
+    public int AnalysisCopyFailures { get; set; }
+}
+
+public sealed class PlaylistSyncPreview
+{
+    public string DestinationEngineLibraryPath { get; set; } = string.Empty;
+    public string DestinationDatabasePath { get; set; } = string.Empty;
+    public bool DestinationDatabaseExists { get; set; }
+    public int SelectedPlaylistCount { get; set; }
+    public int PlaylistRows { get; set; }
+    public int UniqueTracks { get; set; }
+    public int FilesToCopy { get; set; }
+    public int FilesAlreadyOnDestination { get; set; }
+    public int SourceFilesMissing { get; set; }
+    public List<PlaylistSyncPlaylistPreview> Playlists { get; } = new();
+    public List<PlaylistSyncTrackPreview> Tracks { get; } = new();
+}
+
 internal sealed record PlaylistRow(long Id, string Title, long ParentListId);
+internal sealed record PlaylistEntityTrackRow(long EntityId, long TrackId, long NextEntityId, string StoredPath, string Title, string Artist);
+internal sealed record PlaylistTrackRow(long TrackId, string StoredPath, string Title, string Artist);
+internal sealed record PlaylistDriveDatabasePlaylistPlan(long SourcePlaylistId, string Path, IReadOnlyList<PlaylistTrackRow> Tracks);
+internal sealed class TrackAnalysisCopyResult
+{
+    public int PerformanceDataRowsCopied { get; set; }
+    public int PerformanceDataRowsMissing { get; set; }
+    public int TrackAnalysisFieldsCopied { get; set; }
+    public int OverviewDataFilesCopied { get; set; }
+    public int OverviewDataFilesMissing { get; set; }
+    public int Failures { get; set; }
+}
+internal sealed record PlaylistEnsureResult(long PlaylistId, int CreatedCount);
 internal sealed record ImportTarget(long PlaylistId, string DisplayPath, bool WasCreated);
 internal sealed record TrackMetadata(string? Title, string? Artist, string? Album, int DurationSeconds, int Bpm, int Year, int Bitrate);
 internal sealed record TrackInsertResult(long TrackId, bool WasInserted, TrackPlaylistReference Reference);

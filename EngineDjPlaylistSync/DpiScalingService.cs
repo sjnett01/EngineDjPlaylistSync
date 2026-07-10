@@ -55,7 +55,12 @@ internal static class DpiScalingService
     {
         foreach (Form form in Application.OpenForms)
         {
-            AttachForm(form, false, form.Text, _defaultLog);
+            if (AttachedForms.ContainsKey(form))
+            {
+                continue;
+            }
+
+            AttachForm(form, TryInferDarkMode(form), form.Text, _defaultLog);
         }
     }
 
@@ -189,6 +194,25 @@ internal static class DpiScalingService
     private static string GetFormName(Form form)
     {
         return string.IsNullOrWhiteSpace(form.Text) ? form.GetType().Name : form.Text;
+    }
+
+    private static bool TryInferDarkMode(Form form)
+    {
+        try
+        {
+            var back = form.BackColor;
+            if (back == Color.Empty)
+            {
+                return false;
+            }
+
+            var brightness = (back.R * 0.299) + (back.G * 0.587) + (back.B * 0.114);
+            return brightness < 128;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void EnsureFormFitsCurrentScreen(Form form)

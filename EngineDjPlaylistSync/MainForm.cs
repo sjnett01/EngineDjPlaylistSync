@@ -23,9 +23,10 @@ public sealed class MainForm : Form
         TextAlign = ContentAlignment.MiddleLeft,
         Font = new Font("Segoe UI", 12F, FontStyle.Bold)
     };
-    private readonly Button _browseDbButton = new() { Text = LocalizationManager.Text("Button.Browse") };
-    private readonly Button _browseMusicButton = new() { Text = LocalizationManager.Text("Button.Browse") };
+    private readonly Button _browseDbButton = new() { Text = LocalizationManager.Text("Button.Browse"), Anchor = AnchorStyles.Left | AnchorStyles.Right, AutoSize = false };
+    private readonly Button _browseMusicButton = new() { Text = LocalizationManager.Text("Button.Browse"), Anchor = AnchorStyles.Left | AnchorStyles.Right, AutoSize = false };
     private readonly Button _scanButton = new() { Text = LocalizationManager.Text("Button.Preview") };
+    private readonly Button _syncPlaylistsButton = new() { Text = LocalizationManager.Text("Button.SyncPlaylists"), Width = 190, AutoSize = false };
     private readonly Button _missingFilesButton = new() { Text = LocalizationManager.Text("Button.MissingFiles"), Width = 150, AutoSize = false };
     private readonly TextBox _logTextBox = new() { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
     private readonly Label _statusLabel = new() { AutoSize = true, Text = LocalizationManager.Text("Status.Ready") };
@@ -109,6 +110,7 @@ public sealed class MainForm : Form
 
         var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.LeftToRight, WrapContents = true, AutoScroll = false };
         actions.Controls.Add(_scanButton);
+        actions.Controls.Add(_syncPlaylistsButton);
         main.SetColumnSpan(actions, 3);
         main.Controls.Add(actions, 0, 5);
 
@@ -156,6 +158,7 @@ public sealed class MainForm : Form
         _browseMusicButton.Click += (_, _) => BrowseForMusicFolder();
         _dbPathTextBox.TextChanged += (_, _) => { if (!_loadingSettings) { SaveSettings(); UpdateCollectionNamePreview(); } };
         _scanButton.Click += async (_, _) => await ScanAsync();
+        _syncPlaylistsButton.Click += (_, _) => OpenPlaylistSyncDialog();
         _missingFilesButton.Click += (_, _) => OpenMissingFileManager();
         _darkModeCheckBox.CheckedChanged += (_, _) => { if (!_loadingSettings) { SaveSettings(); ApplyTheme(); } };
         _languageComboBox.SelectedIndexChanged += (_, _) =>
@@ -354,6 +357,14 @@ public sealed class MainForm : Form
         if (!ValidateInputs(out var dbPath, out var musicFolder)) return;
 
         using var dialog = new MissingFilesDialog(dbPath, musicFolder, _darkModeCheckBox.Checked);
+        dialog.ShowDialog(this);
+    }
+
+    private void OpenPlaylistSyncDialog()
+    {
+        if (!ValidateInputs(out var dbPath, out var musicFolder)) return;
+
+        using var dialog = new PlaylistSyncDialog(dbPath, musicFolder, _darkModeCheckBox.Checked);
         dialog.ShowDialog(this);
     }
 
@@ -577,6 +588,7 @@ public sealed class MainForm : Form
         _browseDbButton.Enabled = !busy;
         _browseMusicButton.Enabled = !busy;
         _scanButton.Enabled = !busy;
+        _syncPlaylistsButton.Enabled = !busy;
         _missingFilesButton.Enabled = !busy;
         if (status is not null) SetStatus(status);
     }
@@ -636,6 +648,7 @@ public sealed class MainForm : Form
         _browseDbButton.Text = LocalizationManager.Text("Button.Browse");
         _browseMusicButton.Text = LocalizationManager.Text("Button.Browse");
         _scanButton.Text = LocalizationManager.Text("Button.Preview");
+        _syncPlaylistsButton.Text = LocalizationManager.Text("Button.SyncPlaylists");
         _missingFilesButton.Text = LocalizationManager.Text("Button.MissingFiles");
         _darkModeCheckBox.Text = LocalizationManager.Text("CheckBox.DarkMode");
         _languageLabel.Text = LocalizationManager.Text("Label.Language");
